@@ -68,6 +68,8 @@ class TimeSeriesMovedInTimeComparer():
         for element_index in range(batch_size):
             sample = input_data[element_index]
             normalized_sample = self._normalize(sample)
+            normalized_sample_v2 = self._normalize_v2(sample)
+            assert torch.allclose(normalized_sample, normalized_sample_v2, rtol=1e-05, atol=1e-08), "Tensory nie są praktycznie równe"
             self.logger.debug(f"normalized_sample:  {normalized_sample.shape}")
             
             channels_number = normalized_sample.shape[0]
@@ -85,7 +87,10 @@ class TimeSeriesMovedInTimeComparer():
                 
                 for comparison_channel_index in range(channels_number):
                     comparison_channel_series = normalized_sample[comparison_channel_index]
-                    similarity_value = self._apply_kerneled_mse_on_one_series(comparison_channel_series, refference_kernels)
+                    
+                    
+                    similarity_value = self._apply_kerneled_mse_on_one_series_v2(comparison_channel_series, refference_kernels)
+
                     similar_points = self._find_similar_regions(similarity_value, self.similarity_threshold)
                     distance_between_similar_points = self._calculate_best_distance_between_similar_point(similar_points, self.comparisonMode)
                     similar_points_counter = self.count_valid_similar_point_distances(similar_points)
@@ -121,6 +126,21 @@ class TimeSeriesMovedInTimeComparer():
             result_list.append(constant_shifting_y)
         result = torch.stack(result_list)
         return result
+    
+    def _normalize_v2(self, input_series:torch.Tensor)->torch.Tensor:
+        """Przesunięcie danych do jednego poziomu
+        
+        Args:
+            input_series (torch.Tensor) [channels, length]
+            
+        Returns:
+            (torch.Tensor) [channels, length]
+        """
+        mean_values = torch.tensor([0.0, -0.32172874023188663, 0.9329161398211201, 1.050562329499409], device=input_series.device)
+        base_mean = torch.mean(input_series[0])
+        # wykonujemy operacje wektorowo zamiast pętli
+        result = input_series - mean_values[:, None] - base_mean
+        return result
 
     def _change_one_series_to_kernels(self, series: torch.Tensor, size: int, bypass: tuple = (0, 0)) -> torch.Tensor:
         """
@@ -139,12 +159,8 @@ class TimeSeriesMovedInTimeComparer():
         self.logger.debug(f"analized_series shape: {analized_series.shape}")
         number_of_kernels = analized_series.shape[-1] // size
 
-        result = []
-        for i in range(number_of_kernels):
-            kernel = analized_series[i * size: i * size + size]
-            result.append(kernel)
-
-        result = torch.stack(result).unsqueeze(1)
+        result = analized_series.unfold(0, size, size).unsqueeze(1)
+        
         self.logger.debug(f"\t\t\tchange_one_series_to_kernels - liczba kernelów: {number_of_kernels}, kształt wyniku: {result.shape}")
         return result
 
@@ -212,7 +228,7 @@ class TimeSeriesMovedInTimeComparer():
             filtered = []
             last_added = None
             for idx in indices:
-                if last_added is None or (idx - last_added).item() >= 10:
+                if last_added is None or (idx - last_added).item() >= self.size_of_kernel:
                     filtered.append(idx)
                     last_added = idx
 
@@ -246,7 +262,7 @@ class TimeSeriesMovedInTimeComparer():
             filtered = []
             last_added = None
             for idx in indices:
-                if last_added is None or (idx - last_added).item() >= 10:
+                if last_added is None or (idx - last_added).item() >= self.size_of_kernel:
                     filtered.append(idx)
                     last_added = idx
 
@@ -268,27 +284,6 @@ class TimeSeriesMovedInTimeComparer():
         Returns:
             float: value based on repetition of all kernels
         """
-        # input_data = input_data.float()
-        
-        # base = input_data[base_channel_index]
-        # result = 0.0
-
-        # for channel_index in range(input_data.shape[0]):
-        #     compare_tensor = input_data[channel_index]
-            
-        #     if base_channel_index == channel_index:
-        #         counter = Counter(base.tolist())  # Counter wymaga listy z wartościami
-        #         dominant_value, _ = counter.most_common(1)[0]
-        #         dominant_value = float(dominant_value)  # KONWERSJA NA FLOAT (by pasowało do tensora)
-        #         value_of_stable_repetition_in_base_sample = torch.mean((base - dominant_value) ** 2)
-        #     else:
-        #         value_of_stable_repetition_in_base_sample = torch.mean((base - compare_tensor) ** 2)
-
-        #     result += value_of_stable_repetition_in_base_sample / input_data.shape[0]
-
-        # return result
-        
-    
         input_data = input_data.float()
         base = input_data[base_channel_index]
         result = 0.0
@@ -362,20 +357,39 @@ class TimeSeriesMovedInTimeComparer():
             result += mse / num_channels
 
         return result/analized_data_lenght
-            
     
-    def _calculate_mark_based_on_order_of_kernels(self, input_data:torch.Tensor, base_channel_index:int):
-        base = input_data[base_channel_index]
-        for channel in input_data:
-            pass
+    def _apply_kerneled_mse_on_one_series_v2(self, series: torch.Tensor, kernels: torch.Tensor) -> torch.Tensor:
+        kernel_length = kernels.shape[-1]
+        padded_series = F.pad(series, (kernel_length // 2, kernel_length // 2), "constant", 0)
+
+        # [L] → [N_windows, kernel_length]
+        unfolded_series = padded_series.unfold(0, kernel_length, 1)  # przesunięcie o 1
+        unfolded_series = unfolded_series.unsqueeze(0)  # [1, N_windows, kernel_length]
+
+        # [N_kernels, 1, kernel_length]
+        kernels_exp = kernels  # [N_kernels, 1, kernel_length]
+
+        # broadcast → [N_kernels, N_windows, kernel_length]
+        diff = torch.abs(kernels_exp - unfolded_series)
+        mse = diff.mean(dim=2)  # [N_kernels, N_windows]
+
+        # padding jeśli trzeba
+        if mse.shape[1] < series.shape[0]:
+            pad_size = series.shape[0] - mse.shape[1]
+            mse = F.pad(mse, (0, pad_size), value=1)
+
+        mse = mse[:, :2200]
+        return mse
+        
+    
     
 if __name__ == "__main__":
     #region konfiguracja loggera
     logger = logging.getLogger("my_debug_logger")
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     console_handler.setFormatter(formatter)
 
@@ -394,6 +408,7 @@ if __name__ == "__main__":
     #endregion 
         start_time = time()
         comparer.compare(real_data)
+    
         stop_time = time()
         print(stop_time-start_time)
-        
+            
