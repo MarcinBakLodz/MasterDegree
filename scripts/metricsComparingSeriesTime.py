@@ -67,9 +67,7 @@ class TimeSeriesMovedInTimeComparer():
         batch_size = input_data.shape[0]
         for element_index in range(batch_size):
             sample = input_data[element_index]
-            normalized_sample = self._normalize(sample)
-            normalized_sample_v2 = self._normalize_v2(sample)
-            assert torch.allclose(normalized_sample, normalized_sample_v2, rtol=1e-05, atol=1e-08), "Tensory nie są praktycznie równe"
+            normalized_sample = self._normalize_v2(sample)
             self.logger.debug(f"normalized_sample:  {normalized_sample.shape}")
             
             channels_number = normalized_sample.shape[0]
@@ -88,11 +86,20 @@ class TimeSeriesMovedInTimeComparer():
                 for comparison_channel_index in range(channels_number):
                     comparison_channel_series = normalized_sample[comparison_channel_index]
                     
-                    
-                    similarity_value = self._apply_kerneled_mse_on_one_series_v2(comparison_channel_series, refference_kernels)
+
+
+                    similarity_value = self._apply_kerneled_mse_on_one_series(comparison_channel_series, refference_kernels)
 
                     similar_points = self._find_similar_regions(similarity_value, self.similarity_threshold)
+                    
                     distance_between_similar_points = self._calculate_best_distance_between_similar_point(similar_points, self.comparisonMode)
+
+                    # start_time_1 = time()
+                    # stop_time_1 = time()
+                    # assert torch.allclose(distance_between_similar_points, distance_between_similar_points_v2, rtol=1e-5, atol=1e-8), "Tensory nie są takie same"
+                    # print(f"przed: {stop_time_1 - start_time_1}")
+                    # print(f"po: {stop_time_2 - start_time_2}")
+
                     similar_points_counter = self.count_valid_similar_point_distances(similar_points)
 
                     distance_between_similar_points_list.append(distance_between_similar_points)
@@ -104,7 +111,14 @@ class TimeSeriesMovedInTimeComparer():
                 self.logger.debug(f"distance_between_similar_points_tensor: {distance_between_similar_points_tensor.shape}")
                 self.logger.debug(f"similar_points_counter_tensor: {similar_points_counter_tensor.shape}")
                 
-                mark_similar_repetition_distances = self._calculate_mark_based_on_similar_repetition_distance(distance_between_similar_points_tensor, refference_channel_index, comparison_channel_series.shape[0])
+
+                mark_similar_repetition_distances = self._calculate_mark_based_on_similar_repetition_distance_v2(distance_between_similar_points_tensor, refference_channel_index, comparison_channel_series.shape[0])
+                # start_time_2 = time()
+                # stop_time_2 = time()
+                # assert torch.equal(mark_similar_repetition_distances, mark_similar_repetition_distances_v2), "Tensory nie są takie same"
+                # print(f"przed: {stop_time_1 - start_time_1}")
+                # print(f"po: {stop_time_2 - start_time_2}")
+
                 mark_similar_repetition_counter = self._calculate_mark_based_on_similar_repetition_counter(similar_points_counter_tensor, refference_channel_index)
                 self.logger.debug(f"mark_similar_repetition_counter: {mark_similar_repetition_counter} / {mark_similar_repetition_distances}")
         pass
@@ -127,21 +141,21 @@ class TimeSeriesMovedInTimeComparer():
         result = torch.stack(result_list)
         return result
     
-    def _normalize_v2(self, input_series:torch.Tensor)->torch.Tensor:
-        """Przesunięcie danych do jednego poziomu
-        
-        Args:
-            input_series (torch.Tensor) [channels, length]
-            
-        Returns:
-            (torch.Tensor) [channels, length]
+    def _normalize_v2(self, input_series: torch.Tensor) -> torch.Tensor:
         """
-        mean_values = torch.tensor([0.0, -0.32172874023188663, 0.9329161398211201, 1.050562329499409], device=input_series.device)
-        base_mean = torch.mean(input_series[0])
-        # wykonujemy operacje wektorowo zamiast pętli
-        result = input_series - mean_values[:, None] - base_mean
-        return result
+        Normalizes input series by subtracting channel-specific means and the mean of the first channel.
 
+        Args:
+            input_series (torch.Tensor): Shape [channels, length]
+
+        Returns:
+            torch.Tensor: Normalized tensor [channels, length]
+        """
+        mean_values = torch.tensor([0.0, -0.32172874023188663, 0.9329161398211201, 1.050562329499409],
+                                 device=input_series.device, dtype=torch.float32)
+        channel_mean = input_series[0].mean()
+        return input_series - mean_values[:, None] - channel_mean
+    
     def _change_one_series_to_kernels(self, series: torch.Tensor, size: int, bypass: tuple = (0, 0)) -> torch.Tensor:
         """
         Dzieli jednowymiarowy tensor na mniejsze fragmenty o zadanym rozmiarze (kernelach).
@@ -162,46 +176,6 @@ class TimeSeriesMovedInTimeComparer():
         result = analized_series.unfold(0, size, size).unsqueeze(1)
         
         self.logger.debug(f"\t\t\tchange_one_series_to_kernels - liczba kernelów: {number_of_kernels}, kształt wyniku: {result.shape}")
-        return result
-
-    def _apply_kerneled_mse_on_one_series(self, series: torch.Tensor, kernels: torch.Tensor) -> torch.Tensor:
-        """
-        Oblicza średni błąd bezwzględny (MSE) pomiędzy fragmentami serii a zdefiniowanymi kernelami.
-
-        Args:
-            series (torch.Tensor): Jednowymiarowy tensor danych wejściowych.
-            kernels (torch.Tensor): Tensor z kernelami (kształt: N, 1, size).
-
-        Returns:
-            torch.Tensor: Tensor podobieństw (shape: N, L), gdzie L to długość serii z uwzględnieniem paddingu.
-        """
-        
-        self.logger.debug(f"\t\t\tapply_kerneled_mse_on_one_series - wejście: series.shape={series.shape}, kernels.shape={kernels.shape}")
-        kernel_lenght = kernels.shape[-1]
-
-        # Padding umożliwia przesuwanie kernela po serii
-        analized_series = F.pad(series, (kernel_lenght // 2, kernel_lenght // 2), "constant", 0)
-
-        result = []
-        for i in range(analized_series.shape[-1] - kernel_lenght):
-            part_of_analized_series = analized_series[i:i + kernel_lenght]
-
-            # Obliczenie błędu bezwzględnego między fragmentem a wszystkimi kernelami
-            analized_sum = abs(kernels - part_of_analized_series)
-            analized_sum = analized_sum.sum(dim=2) / kernel_lenght  # Średnia błędu
-            analized_sum = analized_sum.squeeze(1)
-
-            result.append(analized_sum)
-
-        result = torch.stack(result, dim=1)
-
-        # Uzupełnienie wyników zerami, jeśli jest krótszy niż oryginalna seria
-        if result.shape[-1] < series.shape[-1]:
-            pad_size = series.shape[-1] - result.shape[-1]
-            result = F.pad(result, (0, pad_size), value=1)
-            self.logger.debug(f"\t\t\tapply_kerneled_mse_on_one_series - padding applied: pad_size={pad_size}")
-
-        self.logger.debug(f"\t\t\tapply_kerneled_mse_on_one_series - wynikowy kształt: {result.shape}")
         return result
 
     def _find_similar_regions(self, mse_result: torch.Tensor, threshold: float) -> torch.Tensor:
@@ -357,29 +331,76 @@ class TimeSeriesMovedInTimeComparer():
             result += mse / num_channels
 
         return result/analized_data_lenght
+
+    def _calculate_mark_based_on_similar_repetition_distance_v2(
+        self, 
+        input_data: torch.Tensor, 
+        base_channel_index: int, 
+        analized_data_length: int
+    ) -> float:
+        """
+        Calculates a score based on repetition patterns in the input tensor [channels, kernels].
+        For the base channel, computes the MSE of non-zero values relative to the mode.
+        For other channels, computes MSE between non-zero values and the base channel.
+
+        Args:
+            input_data (torch.Tensor): Input tensor of shape [channels, kernels]
+            base_channel_index (int): Index of the base channel
+            analized_data_length (int): Length of analyzed data
+
+        Returns:
+            float: Normalized MSE-based score
+        """
+        input_data = input_data.float()
+        base = input_data[base_channel_index]
+        num_channels = input_data.shape[0]
+        result = torch.tensor(0.0, device=input_data.device)
+
+        # Pre-compute mask for non-zero base values to avoid redundant computation
+        nonzero_mask = base != 0
+        
+        for channel_index in range(num_channels):
+            compare_tensor = input_data[channel_index]
+            
+            if channel_index == base_channel_index:
+                if not nonzero_mask.any():
+                    continue
+                    
+                # Use torch.mode for faster mode calculation
+                dominant_value = torch.mode(base[nonzero_mask])[0].float()
+                
+                mse_input = (base[nonzero_mask] - dominant_value) ** 2
+            else:
+                # Combined mask for non-zero values in either tensor
+                valid_mask = nonzero_mask | (compare_tensor != 0)
+                if not valid_mask.any():
+                    continue
+                    
+                mse_input = (base[valid_mask] - compare_tensor[valid_mask]) ** 2
+            
+            result += mse_input.mean() / num_channels
+        
+        return result / analized_data_length
     
-    def _apply_kerneled_mse_on_one_series_v2(self, series: torch.Tensor, kernels: torch.Tensor) -> torch.Tensor:
+    def _apply_kerneled_mse_on_one_series(self, series: torch.Tensor, kernels: torch.Tensor) -> torch.Tensor:
+        """
+        Applies kernel-based MSE comparison on a single series.
+
+        Args:
+            series (torch.Tensor): 1D input series
+            kernels (torch.Tensor): Shape [num_kernels, 1, kernel_length]
+
+        Returns:
+            torch.Tensor: MSE values [num_kernels, sequence_length]
+        """
         kernel_length = kernels.shape[-1]
         padded_series = F.pad(series, (kernel_length // 2, kernel_length // 2), "constant", 0)
-
-        # [L] → [N_windows, kernel_length]
-        unfolded_series = padded_series.unfold(0, kernel_length, 1)  # przesunięcie o 1
-        unfolded_series = unfolded_series.unsqueeze(0)  # [1, N_windows, kernel_length]
-
-        # [N_kernels, 1, kernel_length]
-        kernels_exp = kernels  # [N_kernels, 1, kernel_length]
-
-        # broadcast → [N_kernels, N_windows, kernel_length]
-        diff = torch.abs(kernels_exp - unfolded_series)
-        mse = diff.mean(dim=2)  # [N_kernels, N_windows]
-
-        # padding jeśli trzeba
+        unfolded_series = padded_series.unfold(0, kernel_length, 1).unsqueeze(0)
+        mse = (kernels - unfolded_series).abs().mean(dim=2)
+        
         if mse.shape[1] < series.shape[0]:
-            pad_size = series.shape[0] - mse.shape[1]
-            mse = F.pad(mse, (0, pad_size), value=1)
-
-        mse = mse[:, :2200]
-        return mse
+            mse = F.pad(mse, (0, series.shape[0] - mse.shape[1]), value=1)
+        return mse[:, :series.shape[0]]
         
     
     
