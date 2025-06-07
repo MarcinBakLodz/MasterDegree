@@ -159,6 +159,7 @@ class GAN(nn.Module):
                 if i % 100 == 0:
                     with torch.no_grad():
                         sample = self.generator(torch.randn(1, 2).to(device)).cpu().numpy()
+                        sample = sample[0].detach().cpu().numpy()
                         self.log_data_as_plot(sample, epoch, i, "generated")
 
             
@@ -187,7 +188,6 @@ class GAN(nn.Module):
             data = data.permute(0, 2, 1)
             input_data = data.to(device).float()
             normalized_input_data, normalizing_factor = self.normalize(input_data)
-            denormalized_input_data = self.denormalize(normalized_input_data, normalizing_factor)
             
             # Forward pass
             optimizer.zero_grad()
@@ -198,7 +198,7 @@ class GAN(nn.Module):
             reconstructed = reconstructed[:, :, :2200]
             mse_loss = loss_fn(reconstructed.float(), input_data)
             dtw_grade = self.channel_dtw_similarity(normalized_input_data.float())
-            dtw_loss = loss_fn.mse_loss(dtw_grade, torch.zeros_like(dtw_grade))
+            dtw_loss = loss_fn(dtw_grade, torch.zeros_like(dtw_grade))
             
             total_loss = mse_loss + dtw_loss
             
@@ -214,24 +214,20 @@ class GAN(nn.Module):
             if i % 100 == 0:
                 with torch.no_grad():
                     print("wszedlem")
-                    sample_input = input_data[0].detach().cpu().numpy()
                     normalized_sample_input = normalized_input_data[0].detach().cpu().numpy()
-                    denormalized_sample_input = denormalized_input_data[0].detach().cpu().numpy()
                     sample_recon = reconstructed[0].detach().cpu().numpy()
                     self.log_data_as_plot(sample_recon, epoch, i, "reconstruction")
-                    self.log_data_as_plot(sample_input, epoch, i, "input")
                     self.log_data_as_plot(normalized_sample_input, epoch, i, "normalized_sample")
-                    self.log_data_as_plot(denormalized_sample_input, epoch, i, "denormalized_sample")
 
-        print(f"Epoch [{epoch+1}/{num_epochs}] Reconstruction_AE_train_Loss: {loss.item():.4f}")
+        print(f"Epoch [{epoch+1}/{num_epochs}] Reconstruction_AE_train_Loss: {total_loss.item():.4f}")
         
     def _AE_validation_phase(self, dataloader, loss_fn, epoch):
         for i, (data, label, localization) in enumerate(dataloader):
-            self.generator.eval()
             # Prepare real data
             data = data.reshape(data.size(0), -1, data.size(3))
             data = data.permute(0, 2, 1)
             input_data = data.to(device).float()
+            normalized_input_data, normalizing_factor = self.normalize(input_data)
             
             # Forward pass
             z = torch.stack([label, localization], dim=1).float()
@@ -239,20 +235,27 @@ class GAN(nn.Module):
             reconstructed = self.generator(z)
             # Truncate reconstructed output to match input_data's sequence length
             reconstructed = reconstructed[:, :, :2200]
-            loss = loss_fn(reconstructed.float(), input_data)
+            mse_loss = loss_fn(reconstructed.float(), input_data)
+            dtw_grade = self.channel_dtw_similarity(normalized_input_data.float())
+            dtw_loss = loss_fn.mse_loss(dtw_grade, torch.zeros_like(dtw_grade))
+            
+            total_loss = mse_loss + dtw_loss
+            
 
             # Log loss
-            self.experiment.log_metric("Reconstruction_AE_validation_Loss", loss.item(), step=epoch * len(dataloader) + i)
-
+            self.experiment.log_metric("Total_AE_val_Loss", total_loss.item(), step=epoch * len(dataloader) + i)
+            self.experiment.log_metric("MSE_AE_val_Loss", total_loss.item(), step=epoch * len(dataloader) + i)
+            self.experiment.log_metric("DTW_AE_val_Loss", total_loss.item(), step=epoch * len(dataloader) + i)
             # Log reconstructed sample every 100 iterations
             if i % 100 == 0:
                 with torch.no_grad():
-                    sample_input = input_data[0].detach().cpu().numpy()
+                    print("wszedlem")
+                    normalized_sample_input = normalized_input_data[0].detach().cpu().numpy()
                     sample_recon = reconstructed[0].detach().cpu().numpy()
-                    self.log_data_as_plot(sample_recon, epoch, i, "reconstruction")
-                    self.log_data_as_plot(sample_input, epoch, i, "input")
+                    self.log_data_as_plot(sample_recon, epoch, i, "reconstruction_val")
+                    self.log_data_as_plot(normalized_sample_input, epoch, i, "normalized_sample_val")
 
-        print(f"Epoch [{epoch+1}/{num_epochs}] Reconstruction Loss: {loss.item():.4f}")
+        print(f"Epoch [{epoch+1}/{num_epochs}] Reconstruction_AE_val_Loss: {total_loss.item():.4f}")
     #endregion  
     
     #region utils  
@@ -335,7 +338,7 @@ if __name__ == "__main__":
     # Training loop
     full_model = GAN(generator, discriminator, experiment)
     full_model.fit_AE(dataloader, 1000)
-    full_model.fit_GAN(dataloader, 3)
+    full_model.fit_GAN(dataloader, 1000)
     
     experiment.end()
 #endregion
