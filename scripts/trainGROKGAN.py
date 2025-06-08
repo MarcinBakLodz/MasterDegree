@@ -5,12 +5,14 @@ from torch.utils.data import DataLoader, random_split
 from datasets import LocalizationDataFormat
 from comet_ml import Experiment
 from tslearn.metrics import dtw
+from datetime import datetime
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import uuid
 import random
+import os
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
@@ -22,7 +24,51 @@ print(torch.backends.cudnn.enabled)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
-# Hyperparameters
+# Earlystopping
+class AE_EarlyStopping:
+    def __init__(self, patience=5, min_delta=0.0):
+        """
+        Args:
+            patience (int): How many epochs to wait after last improvement.
+            min_delta (float): Minimum change to qualify as an improvement.
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float('inf')
+        self.counter = 0
+        self.should_stop = False
+
+    def step(self, current_loss):
+        if current_loss < self.best_loss - self.min_delta:
+            self.best_loss = current_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+        return self.should_stop
+    
+class GAN_EarlyStopping:
+    def __init__(self, patience=5, high_loss_threshold=0.8):
+        """
+        Args:
+            patience (int): How many epochs to wait after last improvement.
+            high_loss_threshold (float): Maximum loss value find as bad.
+        """
+        self.patience = patience
+        self.high_loss_threshold = high_loss_threshold
+        self.counter = 0
+        self.should_stop = False
+    
+    def step(self, g_loss, d_loss):
+        if g_loss > self.high_loss_threshold or d_loss > self.high_loss_threshold:
+            self.counter += 1
+        else:
+            self.counter = 0  # reset if losses drop below threshold
+
+        if self.counter >= self.patience:
+            self.should_stop = True
+        return self.should_stop
 
 
 # Generator
@@ -99,78 +145,177 @@ class Discriminator(nn.Module):
         return x
     
 class GAN(nn.Module):
-    def __init__(self, generator, discriminator, experiment):
+    def __init__(self, generator, discriminator, experiment, path):
         super().__init__()
         self.generator = generator
         self.discriminator = discriminator
         self.experiment = experiment
         self.mean_values = torch.tensor([0.0, -0.32172874023188663, 0.9329161398211201, 1.050562329499409]).to(device)
-        
+        self.path = path
+        self.day_timestamp = datetime.now().strftime('%Y-%m-%d-%H-%M')
                 
     #region GAN            
-    def fit_GAN(self, dataloader, num_epochs, learning_rate):
+    def fit_GAN(self, train_dataloader, val_dataloader, num_epochs, learning_rate, patience = 50, high_loss_threshold = 0.8, G_D_ratio = 4):
         adversarial_loss = nn.BCEWithLogitsLoss()
+        earlystopper = GAN_EarlyStopping(patience, high_loss_threshold)
         optimizer_G = optim.Adam(generator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
-        optimizer_D = optim.Adam(discriminator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+        optimizer_D = optim.Adam(discriminator.parameters(), lr=learning_rate*0.1, betas=(0.5, 0.999))
         
+        self.num_epochs = num_epochs
         for epoch in range(num_epochs):
             # train phase
-            for i, (data, label, localization) in enumerate(dataloader):
-                # Prepare real data
-                data = data.reshape(data.size(0), -1, data.size(3))
-                data = data.permute(0, 2, 1)
-                real_data = data.to(device).float()
-                batch_size_current = real_data.size(0)
-                
-                # Labels
-                real_label = torch.ones(batch_size_current, 1).to(device)
-                fake_label = torch.zeros(batch_size_current, 1).to(device)
-                
-                # Train Discriminator
-                optimizer_D.zero_grad()
-                real_output = self.discriminator(real_data)
-                d_loss_real = adversarial_loss(real_output, real_label)
-                
-                z = torch.stack([label, localization], dim=1).float()
-                z = z.to(device)
-
-                fake_data = self.generator(z)
-
-                fake_output = self.discriminator(fake_data.detach())
-                d_loss_fake = adversarial_loss(fake_output, fake_label)
-                
-                d_loss = (d_loss_real + d_loss_fake) / 2
-                d_loss.backward()
-                optimizer_D.step()
-                
-                # Train Generator
-                optimizer_G.zero_grad()
-                fake_output = self.discriminator(fake_data)
-                g_loss = adversarial_loss(fake_output, real_label)
-                g_loss.backward()
-                optimizer_G.step()
-                
-                # Log losses
-                self.experiment.log_metric("D_loss", d_loss.item(), step=epoch * len(dataloader) + i)
-                self.experiment.log_metric("G_loss", g_loss.item(), step=epoch * len(dataloader) + i)
-                
-                # Log generated samples every 100 iterations
-                if i % 100 == 0:
-                    with torch.no_grad():
-                        sample = self.generator(torch.randn(1, 2).to(device))
-                        sample = sample[0].detach().cpu().numpy()
-                        self.log_data_as_plot(sample, epoch, i, "generated")
-
-            
-            print(f"Epoch [{epoch+1}/{num_epochs}] D_loss: {d_loss.item():.4f} G_loss: {g_loss.item():.4f}")
+            self._GAN_train_phase(train_dataloader, optimizer_G, optimizer_D, adversarial_loss, epoch, G_D_ratio)
             # validation phase
-            
+            val_g_loss, val_d_loss = self._GAN_val_phase(val_dataloader, optimizer_G, optimizer_D, adversarial_loss, epoch)
             # early stopping phase
+            if earlystopper.step(val_g_loss, val_d_loss):
+                print(f"GAN: Training stopped due to high loss for {patience} consecutive epochs.")
+                
+                save_dir = os.path.join(self.path, self.day_timestamp, "GAN")
+                os.makedirs(save_dir, exist_ok=True)
+
+                save_path = os.path.join(save_dir, "best_generator_GAN_phase.pt")
+                torch.save(self.generator.state_dict(), save_path)
+                break
+
+        print(f"GAN: pass all planned steps.")
+        
+        save_dir = os.path.join(self.path, self.day_timestamp, "GAN")
+        os.makedirs(save_dir, exist_ok=True)
+
+        save_path = os.path.join(save_dir, "last_generator_GAN_phase.pt")
+        torch.save(self.generator.state_dict(), save_path)
+
+    def _GAN_train_phase(self, dataloader, optimizer_G, optimizer_D, loss_fn, epoch, G_D_ratio):
+        self.generator.train()
+        self.discriminator.train()
+
+        total_g_loss = 0.0
+        total_d_loss = 0.0
+
+        for i, (data, label, localization) in enumerate(dataloader):
+            # Prepare real data
+            data = data.reshape(data.size(0), -1, data.size(3))
+            data = data.permute(0, 2, 1)
+            real_data = data.to(device).float()
+            normalized_input_data, normalizing_factor = self.normalize(real_data)
+            batch_size_current = normalized_input_data.size(0)
+            
+            # Labels
+            real_label = torch.ones(batch_size_current, 1).to(device)
+            fake_label = torch.zeros(batch_size_current, 1).to(device)
+            
+            # Train Discriminator
+            optimizer_D.zero_grad()
+            real_output = self.discriminator(normalized_input_data)
+            d_loss_real = loss_fn(real_output, real_label)
+            
+            z = torch.stack([label, localization], dim=1).float()
+            z = z.to(device)
+
+            fake_data = self.generator(z)
+
+            fake_output = self.discriminator(fake_data.detach())
+            d_loss_fake = loss_fn(fake_output, fake_label)
+            
+            d_loss = (d_loss_real + d_loss_fake) / 2
+            d_loss.backward()
+            total_d_loss += d_loss.item()
+            optimizer_D.step()
+            
+            # Train Generator
+            for _ in range(G_D_ratio):
+                optimizer_G.zero_grad()
+                fake_data = self.generator(z)  # Regenerate fake data for each step if needed
+                fake_output = self.discriminator(fake_data)
+                g_loss = loss_fn(fake_output, real_label)
+                g_loss.backward()
+                total_g_loss += g_loss.item()
+                optimizer_G.step()
+            
+            # Log losses
+            self.experiment.log_metric("D_loss", d_loss.item(), step=epoch * len(dataloader) + i)
+            self.experiment.log_metric("G_loss", g_loss.item(), step=epoch * len(dataloader) + i)
+            
+
+            # Log generated samples every 100 iterations
+            if i % 100 == 0:
+                with torch.no_grad():
+                    sample = self.generator(torch.randn(1, 2).to(device))
+                    sample = sample[0].detach().cpu().numpy()
+                    self.log_data_as_plot(sample, epoch, i, "generated")
+
+        total_g_loss = total_g_loss/(len(dataloader)*G_D_ratio)
+        total_d_loss = total_d_loss/(len(dataloader)*G_D_ratio)
+        
+        print(f"Epoch [{epoch+1}/{self.num_epochs}] D_loss: {total_d_loss:.4f} G_loss: {total_g_loss:.4f}")
+
+    def _GAN_val_phase(self, dataloader, optimizer_G, optimizer_D, loss_fn, epoch):
+        self.generator.eval()
+        self.discriminator.eval()
+
+        total_g_loss = 0.0
+        total_d_loss = 0.0
+
+        for i, (data, label, localization) in enumerate(dataloader):
+            # Prepare real data
+            data = data.reshape(data.size(0), -1, data.size(3))
+            data = data.permute(0, 2, 1)
+            real_data = data.to(device).float()
+            normalized_input_data, normalizing_factor = self.normalize(real_data)
+            batch_size_current = real_data.size(0)
+            
+            # Labels
+            real_label = torch.ones(batch_size_current, 1).to(device)
+            fake_label = torch.zeros(batch_size_current, 1).to(device)
+            
+            # Train Discriminator
+            optimizer_D.zero_grad()
+            real_output = self.discriminator(normalized_input_data)
+            d_loss_real = loss_fn(real_output, real_label)
+
+
+            z = torch.stack([label, localization], dim=1).float()
+            z = z.to(device)
+
+            fake_data = self.generator(z)
+
+            fake_output = self.discriminator(fake_data.detach())
+            d_loss_fake = loss_fn(fake_output, fake_label)
+            
+            d_loss = (d_loss_real + d_loss_fake) / 2
+            total_d_loss += d_loss.item()
+
+            
+            # Train Generator
+            optimizer_G.zero_grad()
+            fake_output = self.discriminator(fake_data)
+            g_loss = loss_fn(fake_output, real_label)
+            total_g_loss += g_loss.item()
+            
+            # Log losses
+            self.experiment.log_metric("D_loss", d_loss.item(), step=epoch * len(dataloader) + i)
+            self.experiment.log_metric("G_loss", g_loss.item(), step=epoch * len(dataloader) + i)
+            
+            # Log generated samples every 100 iterations
+            if i % 100 == 0:
+                with torch.no_grad():
+                    sample = self.generator(torch.randn(1, 2).to(device))
+                    sample = sample[0].detach().cpu().numpy()
+                    self.log_data_as_plot(sample, epoch, i, "generated")
+
+        total_g_loss = total_g_loss/len(dataloader)
+        total_d_loss = total_d_loss/len(dataloader)
+
+        print(f"Epoch [{epoch+1}/{self.num_epochs}] D_loss: {total_d_loss:.4f} G_loss: {total_g_loss:.4f}")
+        return total_g_loss, total_d_loss
+
     #endregion
 
     #region AE
-    def fit_AE(self, train_dataloader, num_epochs, learning_rate):
+    def fit_AE(self, train_dataloader, validation_dataloader, num_epochs, learning_rate, patience = 50, min_delta = 0.001):
         reconstruction_loss_fn = nn.MSELoss()
+        early_stopping = AE_EarlyStopping(patience=patience, min_delta=min_delta)
         optimizer = optim.Adam(self.generator.parameters(), lr=learning_rate)
         self.num_epochs = num_epochs
 
@@ -178,9 +323,30 @@ class GAN(nn.Module):
             # train phase
             self._AE_train_phase(train_dataloader, optimizer, reconstruction_loss_fn, epoch)
             # validation phase
+            val_loss = self._AE_validation_phase(validation_dataloader, reconstruction_loss_fn, epoch)
             # early stopping phase
+            if early_stopping.step(val_loss):
+                print("AE: Early stopping triggered. Training stopped")
+                print(f"✅ Model saved with val_loss = {early_stopping.best_loss:.4f}")
+
+                save_dir = os.path.join(self.path, self.day_timestamp, "AE")
+                os.makedirs(save_dir, exist_ok=True)
+
+                save_path = os.path.join(save_dir, "best_generator_AE_phase.pt")
+                torch.save(self.generator.state_dict(), save_path)
+                break
+        print("AE: Passed all planned steps.")
+        print(f"✅ Model saved with val_loss = {early_stopping.best_loss:.4f}")
+
+        save_dir = os.path.join(self.path, self.day_timestamp, "AE")
+        os.makedirs(save_dir, exist_ok=True)
+
+        save_path = os.path.join(save_dir, "last_generator_AE_phase.pt")
+        torch.save(self.generator.state_dict(), save_path)
+
             
     def _AE_train_phase(self, dataloader, optimizer, loss_fn, epoch):
+        total_loss = 0
         self.generator.train()
         for i, (data, label, localization) in enumerate(dataloader):
             # Prepare real data
@@ -196,20 +362,16 @@ class GAN(nn.Module):
             reconstructed = self.generator(z)
             # Truncate reconstructed output to match input_data's sequence length
             reconstructed = reconstructed[:, :, :2200]
-            mse_loss = loss_fn(reconstructed.float(), input_data)
-            dtw_grade = self.channel_dtw_similarity(normalized_input_data.float())
-            dtw_loss = loss_fn(dtw_grade, torch.zeros_like(dtw_grade))
-            
-            total_loss = mse_loss + dtw_loss
+            loss = self._calculate_AE_loss(reconstructed, input_data, loss_fn)
+
+            total_loss += loss.item()
             
             # Backward and optimize
-            total_loss.backward()
+            loss.backward()
             optimizer.step()
 
             # Log loss
-            self.experiment.log_metric("Total_AE_train_Loss", total_loss.item(), step=epoch * len(dataloader) + i)
-            self.experiment.log_metric("MSE_AE_train_Loss", total_loss.item(), step=epoch * len(dataloader) + i)
-            self.experiment.log_metric("DTW_AE_train_Loss", total_loss.item(), step=epoch * len(dataloader) + i)
+            self.experiment.log_metric("MSE_AE_train_Loss", loss.item(), step=epoch * len(dataloader) + i)
             # Log reconstructed sample every 100 iterations
             if i % 100 == 0:
                 with torch.no_grad():
@@ -217,10 +379,11 @@ class GAN(nn.Module):
                     sample_recon = reconstructed[0].detach().cpu().numpy()
                     self.log_data_as_plot(sample_recon, epoch, i, "reconstruction")
                     self.log_data_as_plot(normalized_sample_input, epoch, i, "normalized_sample")
-
-        print(f"Epoch [{epoch+1}/{self.num_epochs}] Reconstruction_AE_train_Loss: {total_loss.item():.4f}")
+        total_loss = total_loss/len(dataloader)
+        print(f"Epoch [{epoch+1}/{self.num_epochs}] Reconstruction_AE_train_Loss: {total_loss:.4f}")
         
     def _AE_validation_phase(self, dataloader, loss_fn, epoch):
+        total_loss = 0
         for i, (data, label, localization) in enumerate(dataloader):
             # Prepare real data
             data = data.reshape(data.size(0), -1, data.size(3))
@@ -234,17 +397,14 @@ class GAN(nn.Module):
             reconstructed = self.generator(z)
             # Truncate reconstructed output to match input_data's sequence length
             reconstructed = reconstructed[:, :, :2200]
-            mse_loss = loss_fn(reconstructed.float(), input_data)
-            dtw_grade = self.channel_dtw_similarity(normalized_input_data.float())
-            dtw_loss = loss_fn.mse_loss(dtw_grade, torch.zeros_like(dtw_grade))
-            
-            total_loss = mse_loss + dtw_loss
-            
+            loss = self._calculate_AE_loss(reconstructed, input_data, loss_fn)
+
+            total_loss += loss.item()
 
             # Log loss
-            self.experiment.log_metric("Total_AE_val_Loss", total_loss.item(), step=epoch * len(dataloader) + i)
-            self.experiment.log_metric("MSE_AE_val_Loss", total_loss.item(), step=epoch * len(dataloader) + i)
-            self.experiment.log_metric("DTW_AE_val_Loss", total_loss.item(), step=epoch * len(dataloader) + i)
+            self.experiment.log_metric("Total_AE_val_Loss", loss.item(), step=epoch * len(dataloader) + i)
+            self.experiment.log_metric("MSE_AE_val_Loss", loss.item(), step=epoch * len(dataloader) + i)
+            self.experiment.log_metric("DTW_AE_val_Loss", loss.item(), step=epoch * len(dataloader) + i)
             # Log reconstructed sample every 100 iterations
             if i % 100 == 0:
                 with torch.no_grad():
@@ -253,7 +413,15 @@ class GAN(nn.Module):
                     self.log_data_as_plot(sample_recon, epoch, i, "reconstruction_val")
                     self.log_data_as_plot(normalized_sample_input, epoch, i, "normalized_sample_val")
 
-        print(f"Epoch [{epoch+1}/{self.num_epochs}] Reconstruction_AE_val_Loss: {total_loss.item():.4f}")
+        total_loss = total_loss/len(dataloader)
+        print(f"Epoch [{epoch+1}/{self.num_epochs}] Reconstruction_AE_val_Loss: {total_loss:.4f}")
+        return total_loss
+
+    def _calculate_AE_loss(self, output, input, loss_fn):
+        loss = loss_fn(output.float(), input)
+        return loss
+        
+
     #endregion  
     
     #region utils  
@@ -325,7 +493,8 @@ if __name__ == "__main__":
     test_size = total_size - train_size - val_size
     train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
     
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=True)
     # Initialize CometML
     experiment = Experiment(
         api_key="V6xW30HU42MtnnpSl6bsGODZ1",
@@ -334,11 +503,11 @@ if __name__ == "__main__":
     experiment.set_name("Multi-Channel Time Series GAN")
 
     # Training loop
-    full_model = GAN(generator, discriminator, experiment)
+    full_model = GAN(generator, discriminator, experiment, "models\GAN\AE_MSE-GAN")
     print("AE")
-    full_model.fit_AE(dataloader, 3, 3e-5)
+    full_model.fit_AE(train_dataloader, val_dataloader, 1000, 3e-5)
     print("GAN")
-    full_model.fit_GAN(dataloader, 1000, 3e-3)
+    full_model.fit_GAN(train_dataloader, val_dataloader, 1000, 3e-3, patience= 100)
     
     experiment.end()
 #endregion
