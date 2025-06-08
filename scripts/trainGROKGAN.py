@@ -5,6 +5,8 @@ from torch.utils.data import DataLoader, random_split
 from datasets import LocalizationDataFormat
 from comet_ml import Experiment
 from tslearn.metrics import dtw
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import uuid
@@ -13,28 +15,25 @@ import random
 # Set random seed for reproducibility
 torch.manual_seed(42)
 
+print(torch.version.cuda)       # Powinno zwrócić np. '11.8'
+print(torch.backends.cudnn.enabled)
+
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
 
 # Hyperparameters
-latent_dim = 100
-num_epochs = 100
-batch_size = 32
-sequence_length = 2220
-num_channels = 4
-learning_rate = 0.0002
-noise_strength = 0.05
 
 
 # Generator
 class Generator(nn.Module):
-    def __init__(self):
+    def __init__(self, latent_dim = 100, init_size = 3, noise_strength = 0.05, num_channels = 4):
         super(Generator, self).__init__()
         self.latent_dim = latent_dim
-        self.init_size = 3
+        self.init_size = init_size
         self.embeder = nn.Linear(2, latent_dim)
         self.fc = nn.Linear(latent_dim, 512 * self.init_size)
-        self.noise_strength = noise_strength
+        self.noise_strength = noise_strength 
         
         self.conv_blocks = nn.Sequential(
             nn.BatchNorm1d(512),
@@ -78,7 +77,7 @@ class Generator(nn.Module):
 
 # Discriminator
 class Discriminator(nn.Module):
-    def __init__(self):
+    def __init__(self, num_channels = 4):
         super(Discriminator, self).__init__()
         self.features = nn.Sequential(
             nn.Conv1d(num_channels, 64, kernel_size=4, stride=2, padding=0),
@@ -105,11 +104,11 @@ class GAN(nn.Module):
         self.generator = generator
         self.discriminator = discriminator
         self.experiment = experiment
-        self.mean_values = torch.tensor([0.0, -0.32172874023188663, 0.9329161398211201, 1.050562329499409])
+        self.mean_values = torch.tensor([0.0, -0.32172874023188663, 0.9329161398211201, 1.050562329499409]).to(device)
         
                 
     #region GAN            
-    def fit_GAN(self, dataloader, num_epochs):
+    def fit_GAN(self, dataloader, num_epochs, learning_rate):
         adversarial_loss = nn.BCEWithLogitsLoss()
         optimizer_G = optim.Adam(generator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
         optimizer_D = optim.Adam(discriminator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
@@ -158,7 +157,7 @@ class GAN(nn.Module):
                 # Log generated samples every 100 iterations
                 if i % 100 == 0:
                     with torch.no_grad():
-                        sample = self.generator(torch.randn(1, 2).to(device)).cpu().numpy()
+                        sample = self.generator(torch.randn(1, 2).to(device))
                         sample = sample[0].detach().cpu().numpy()
                         self.log_data_as_plot(sample, epoch, i, "generated")
 
@@ -170,9 +169,10 @@ class GAN(nn.Module):
     #endregion
 
     #region AE
-    def fit_AE(self, train_dataloader, num_epochs):
+    def fit_AE(self, train_dataloader, num_epochs, learning_rate):
         reconstruction_loss_fn = nn.MSELoss()
         optimizer = optim.Adam(self.generator.parameters(), lr=learning_rate)
+        self.num_epochs = num_epochs
 
         for epoch in range(num_epochs):
             # train phase
@@ -213,13 +213,12 @@ class GAN(nn.Module):
             # Log reconstructed sample every 100 iterations
             if i % 100 == 0:
                 with torch.no_grad():
-                    print("wszedlem")
                     normalized_sample_input = normalized_input_data[0].detach().cpu().numpy()
                     sample_recon = reconstructed[0].detach().cpu().numpy()
                     self.log_data_as_plot(sample_recon, epoch, i, "reconstruction")
                     self.log_data_as_plot(normalized_sample_input, epoch, i, "normalized_sample")
 
-        print(f"Epoch [{epoch+1}/{num_epochs}] Reconstruction_AE_train_Loss: {total_loss.item():.4f}")
+        print(f"Epoch [{epoch+1}/{self.num_epochs}] Reconstruction_AE_train_Loss: {total_loss.item():.4f}")
         
     def _AE_validation_phase(self, dataloader, loss_fn, epoch):
         for i, (data, label, localization) in enumerate(dataloader):
@@ -249,13 +248,12 @@ class GAN(nn.Module):
             # Log reconstructed sample every 100 iterations
             if i % 100 == 0:
                 with torch.no_grad():
-                    print("wszedlem")
                     normalized_sample_input = normalized_input_data[0].detach().cpu().numpy()
                     sample_recon = reconstructed[0].detach().cpu().numpy()
                     self.log_data_as_plot(sample_recon, epoch, i, "reconstruction_val")
                     self.log_data_as_plot(normalized_sample_input, epoch, i, "normalized_sample_val")
 
-        print(f"Epoch [{epoch+1}/{num_epochs}] Reconstruction_AE_val_Loss: {total_loss.item():.4f}")
+        print(f"Epoch [{epoch+1}/{self.num_epochs}] Reconstruction_AE_val_Loss: {total_loss.item():.4f}")
     #endregion  
     
     #region utils  
@@ -282,7 +280,7 @@ class GAN(nn.Module):
         result = torch.zeros(batch_size)
         
         for b in range(batch_size):
-            batch_data = tensor[b].detach().numpy()
+            batch_data = tensor[b].detach().cpu().numpy()
             dtw_sum = 0.0
             pair_count = 0
             
@@ -320,14 +318,14 @@ if __name__ == "__main__":
 
 
     # Data loading
-    dataset = LocalizationDataFormat(root_dir=r"C:\Users\Marcin\Desktop\Studia\Praca_dyplomowa\Wersja_czerwcowa\MasterDegree\data\localization\v2_samples126_lenght22_typeLocalisation.npz")
+    dataset = LocalizationDataFormat(root_dir=r"data\localization\v2_samples126_lenght22_typeLocalisation.npz")
     total_size = len(dataset)
     train_size = int(0.8 * total_size)
     val_size = int(0.1 * total_size)
     test_size = total_size - train_size - val_size
     train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
     
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
     # Initialize CometML
     experiment = Experiment(
         api_key="V6xW30HU42MtnnpSl6bsGODZ1",
@@ -337,8 +335,10 @@ if __name__ == "__main__":
 
     # Training loop
     full_model = GAN(generator, discriminator, experiment)
-    full_model.fit_AE(dataloader, 1000)
-    full_model.fit_GAN(dataloader, 1000)
+    print("AE")
+    full_model.fit_AE(dataloader, 3, 3e-5)
+    print("GAN")
+    full_model.fit_GAN(dataloader, 1000, 3e-3)
     
     experiment.end()
 #endregion
